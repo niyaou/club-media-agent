@@ -18,6 +18,9 @@ describe("REDnote parser helpers", () => {
     expect(extractNoteIdFromUrl("https://www.xiaohongshu.com/discovery/item/66cafe1234567890abcd123")).toBe(
       "66cafe1234567890abcd123"
     );
+    expect(
+      extractNoteIdFromUrl("https://www.xiaohongshu.com/search_result/66cafe1234567890abcd123?xsec_token=abc&xsec_source=")
+    ).toBe("66cafe1234567890abcd123");
   });
 
   it("returns null when a url does not contain a note id", () => {

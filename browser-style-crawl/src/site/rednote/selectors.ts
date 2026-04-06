@@ -10,8 +10,17 @@ export const REDNOTE_SELECTORS = {
     '[data-testid*="avatar"]'
   ],
   resultAnchors: [
+    'a[href*="/search_result/"]',
     'a[href*="/explore/"]',
     'a[href*="/discovery/item/"]'
+  ],
+  searchResultLikeCounts: [
+    '[class*="like"] [class*="count"]',
+    '[class*="like-count"]',
+    '[class*="interact"] [class*="count"]',
+    '[class*="engage"] [class*="count"]',
+    '[class*="liked"]',
+    '[class*="like"]'
   ],
   newestSortTriggers: [
     'text=最新',

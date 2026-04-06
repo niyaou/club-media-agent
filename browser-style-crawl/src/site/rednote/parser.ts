@@ -1,4 +1,8 @@
-const NOTE_URL_PATTERNS = [/\/explore\/([a-zA-Z0-9]+)/, /\/discovery\/item\/([a-zA-Z0-9]+)/];
+const NOTE_URL_PATTERNS = [
+  /\/explore\/([a-zA-Z0-9]+)/,
+  /\/discovery\/item\/([a-zA-Z0-9]+)/,
+  /\/search_result\/([a-zA-Z0-9]+)/
+];
 
 export function extractNoteIdFromUrl(url: string): string | null {
   try {

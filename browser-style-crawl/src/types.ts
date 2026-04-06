@@ -53,6 +53,12 @@ export interface ExtractedPost {
   comments: VisibleComment[];
 }
 
+export interface SearchResultCandidate {
+  url: string;
+  noteId: string;
+  visibleLikeCount: number | null;
+}
+
 export interface CrawlerRunSummary {
   topicsProcessed: number;
   storedPosts: number;

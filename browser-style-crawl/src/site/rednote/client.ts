@@ -1,5 +1,3 @@
-import { createInterface } from "node:readline/promises";
-import { stdin as input, stdout as output } from "node:process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
@@ -9,15 +7,26 @@ import type {
   CrawlerRunSummary,
   ExtractedPost,
   MediaFileRecord,
+  SearchResultCandidate,
   StoredPostRecord,
   VisibleComment
 } from "../../types.js";
 import { writeCommentsSnapshot, writeMediaManifest, toRelativeStoragePath } from "../../storage/files.js";
 import type { CrawlerDatabase } from "../../storage/database.js";
 import { extractCanonicalUrlFromHtml, extractNoteIdFromUrl, normalizeCount } from "./parser.js";
+import { waitForPageStability, withNavigationRetry } from "./page-stability.js";
 import { REDNOTE_SELECTORS } from "./selectors.js";
 
 const REDNOTE_HOME_URL = "https://www.xiaohongshu.com/";
+const PERSISTENT_BROWSER_OPTIONS = {
+  acceptDownloads: true,
+  headless: false,
+  viewport: { width: 1440, height: 1080 }
+};
+const LOGIN_TIMEOUT_MS = 5 * 60_000;
+const LOGIN_POLL_INTERVAL_MS = 1_000;
+const CLOSED_TARGET_MESSAGE = "Target page, context or browser has been closed";
+const MIN_SEARCH_RESULT_LIKE_COUNT = 10;
 
 interface CrawlTopicOptions {
   topic: string;
@@ -29,21 +38,120 @@ interface CrawlTopicOptions {
   runStartedAt: string;
 }
 
-export async function launchPersistentBrowser(profileDir: string): Promise<BrowserContext> {
-  return chromium.launchPersistentContext(profileDir, {
-    acceptDownloads: true,
-    headless: false,
-    viewport: { width: 1440, height: 1080 }
-  });
+interface LoginWaitOptions {
+  loginTimeoutMs?: number;
+  loginPollIntervalMs?: number;
 }
 
-async function promptForEnter(message: string): Promise<void> {
-  const terminal = createInterface({ input, output });
+export async function launchPersistentBrowser(profileDir: string): Promise<BrowserContext> {
   try {
-    await terminal.question(`${message}\nPress Enter after the step is complete.`);
-  } finally {
-    terminal.close();
+    return await chromium.launchPersistentContext(profileDir, {
+      ...PERSISTENT_BROWSER_OPTIONS,
+      channel: "chrome"
+    });
+  } catch (error) {
+    console.warn(
+      `Chrome launch failed, falling back to bundled Chromium: ${error instanceof Error ? error.message : String(error)}`
+    );
+
+    return chromium.launchPersistentContext(profileDir, PERSISTENT_BROWSER_OPTIONS);
   }
+}
+
+function isRednotePage(page: Page): boolean {
+  return page.url().includes("xiaohongshu.com");
+}
+
+async function getPrimaryRednotePage(context: BrowserContext): Promise<Page> {
+  const pages = context.pages();
+  const primaryPage = pages.find((page) => isRednotePage(page)) ?? pages[0] ?? (await context.newPage());
+
+  for (const page of pages) {
+    if (page === primaryPage || page.isClosed() || page.url() !== "about:blank") {
+      continue;
+    }
+
+    await page.close().catch(() => {});
+  }
+
+  await primaryPage.bringToFront().catch(() => {});
+  return primaryPage;
+}
+
+async function waitForAuthentication(page: Page, timeoutMs: number, pollIntervalMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    if (await isAuthenticated(page)) {
+      return;
+    }
+
+    if (page.isClosed()) {
+      throw new Error("REDnote browser window was closed before login completed.");
+    }
+
+    await page.waitForTimeout(pollIntervalMs);
+  }
+
+  throw new Error("REDnote login was not detected before the timeout expired.");
+}
+
+async function isAuthenticated(page: Page): Promise<boolean> {
+  const pageUrl = page.url();
+  if (pageUrl.includes("/website-login/") || pageUrl.includes("/login")) {
+    return false;
+  }
+
+  const loginVisible = await anySelectorExists(page, REDNOTE_SELECTORS.loginIndicators);
+  if (loginVisible) {
+    return false;
+  }
+
+  return anySelectorExists(page, REDNOTE_SELECTORS.authIndicators);
+}
+
+function isClosedTargetError(error: unknown): boolean {
+  return error instanceof Error && error.message.includes(CLOSED_TARGET_MESSAGE);
+}
+
+function isBrowserConnected(context: BrowserContext): boolean {
+  return context.browser()?.isConnected() ?? true;
+}
+
+export async function openCandidateInDetailPage(
+  context: BrowserContext,
+  detailPage: Page | null,
+  candidateUrl: string
+): Promise<Page> {
+  let currentPage = detailPage;
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (!currentPage || currentPage.isClosed()) {
+      if (!isBrowserConnected(context)) {
+        throw new Error("REDnote browser was disconnected during crawl.");
+      }
+
+      currentPage = await context.newPage();
+    }
+
+    try {
+      await currentPage.goto(candidateUrl, { waitUntil: "domcontentloaded" });
+      await waitForPageStability(currentPage);
+      return currentPage;
+    } catch (error) {
+      if (!isClosedTargetError(error)) {
+        throw error;
+      }
+
+      if (!isBrowserConnected(context)) {
+        throw new Error("REDnote browser was disconnected during crawl.");
+      }
+
+      currentPage = null;
+    }
+  }
+
+  throw new Error(`REDnote detail page closed while opening ${candidateUrl}`);
 }
 
 async function anySelectorExists(page: Page, selectors: readonly string[]): Promise<boolean> {
@@ -100,6 +208,42 @@ function buildSearchUrl(topic: string): string {
   return `https://www.xiaohongshu.com/search_result?keyword=${encodeURIComponent(topic)}&source=web_explore_feed`;
 }
 
+export function parseVisibleLikeCount(value: string | null | undefined): number | null {
+  return normalizeCount(value);
+}
+
+export function filterSearchResultCandidates(
+  candidates: SearchResultCandidate[],
+  database: CrawlerDatabase,
+  minLikeCount = MIN_SEARCH_RESULT_LIKE_COUNT
+): SearchResultCandidate[] {
+  return candidates.filter(
+    (candidate) => candidate.visibleLikeCount !== null && candidate.visibleLikeCount > minLikeCount && !database.hasPost(candidate.noteId)
+  );
+}
+
+function isPreferredSearchResultUrl(url: string): boolean {
+  return url.includes("/search_result/") || url.includes("xsec_token=");
+}
+
+export function dedupeSearchResultCandidates(candidates: SearchResultCandidate[]): SearchResultCandidate[] {
+  const dedupedCandidates = new Map<string, SearchResultCandidate>();
+
+  for (const candidate of candidates) {
+    const existing = dedupedCandidates.get(candidate.noteId);
+    if (!existing) {
+      dedupedCandidates.set(candidate.noteId, candidate);
+      continue;
+    }
+
+    if (isPreferredSearchResultUrl(candidate.url) && !isPreferredSearchResultUrl(existing.url)) {
+      dedupedCandidates.set(candidate.noteId, candidate);
+    }
+  }
+
+  return [...dedupedCandidates.values()];
+}
+
 async function sortResultsByNewest(page: Page): Promise<void> {
   for (const selector of REDNOTE_SELECTORS.newestSortTriggers) {
     try {
@@ -115,35 +259,87 @@ async function sortResultsByNewest(page: Page): Promise<void> {
   }
 }
 
-async function collectCandidateUrls(page: Page): Promise<string[]> {
+async function collectSearchResultCandidates(page: Page): Promise<SearchResultCandidate[]> {
   const selector = REDNOTE_SELECTORS.resultAnchors.join(", ");
-  const urls = await page.locator(selector).evaluateAll((elements) =>
-    elements
-      .map((element) => {
-        if (element instanceof HTMLAnchorElement) {
-          return element.href;
-        }
+  const rawCandidates = await withNavigationRetry(
+    () =>
+      page.locator(selector).evaluateAll((elements, likeSelectors) =>
+        elements
+          .map((element) => {
+            const anchor =
+              element instanceof HTMLAnchorElement
+                ? element
+                : element.closest('a[href*="/search_result/"], a[href*="/explore/"], a[href*="/discovery/item/"]');
 
-        return element.getAttribute("href");
-      })
-      .filter((href): href is string => Boolean(href))
+            if (!(anchor instanceof HTMLAnchorElement)) {
+              return null;
+            }
+
+            const style = window.getComputedStyle(anchor);
+            if (style.display === "none" || style.visibility === "hidden") {
+              return null;
+            }
+
+            let rawLikeText: string | null = null;
+            let container: Element | null = anchor;
+
+            for (let depth = 0; depth < 4 && container && !rawLikeText; depth += 1) {
+              for (const likeSelector of likeSelectors) {
+                const match = container.querySelector(likeSelector);
+                const text = match?.textContent?.trim();
+                if (text) {
+                  rawLikeText = text;
+                  break;
+                }
+              }
+
+              container = container.parentElement;
+            }
+
+            return {
+              url: anchor.href,
+              rawLikeText
+            };
+          })
+          .filter((candidate): candidate is { url: string; rawLikeText: string | null } => Boolean(candidate?.url)),
+        REDNOTE_SELECTORS.searchResultLikeCounts
+      ),
+    () => waitForPageStability(page)
   );
+  const candidates: SearchResultCandidate[] = [];
 
-  return [...new Set(urls)].filter((href) => extractNoteIdFromUrl(href) !== null);
+  for (const candidate of rawCandidates) {
+    const noteId = extractNoteIdFromUrl(candidate.url);
+    if (!noteId) {
+      continue;
+    }
+
+    candidates.push({
+      url: candidate.url,
+      noteId,
+      visibleLikeCount: parseVisibleLikeCount(candidate.rawLikeText)
+    });
+  }
+
+  return dedupeSearchResultCandidates(candidates);
 }
 
 async function collectImageUrls(page: Page): Promise<string[]> {
   const selector = REDNOTE_SELECTORS.imageNodes.join(", ");
-  const urls = await page.locator(selector).evaluateAll((elements) =>
-    elements
-      .map((element) => {
-        if (element instanceof HTMLImageElement) {
-          return element.currentSrc || element.src;
-        }
+  const urls = await withNavigationRetry(
+    () =>
+      page.locator(selector).evaluateAll((elements) =>
+        elements
+          .map((element) => {
+            if (element instanceof HTMLImageElement) {
+              return element.currentSrc || element.src;
+            }
 
-        return element.getAttribute("src");
-      })
-      .filter((src): src is string => Boolean(src))
+            return element.getAttribute("src");
+          })
+          .filter((src): src is string => Boolean(src))
+      ),
+    () => waitForPageStability(page)
   );
 
   return [...new Set(urls)].filter((url) => !url.startsWith("data:"));
@@ -151,27 +347,31 @@ async function collectImageUrls(page: Page): Promise<string[]> {
 
 async function collectVisibleComments(page: Page): Promise<VisibleComment[]> {
   const selector = REDNOTE_SELECTORS.commentItems.join(", ");
-  const comments = await page.locator(selector).evaluateAll((elements) =>
-    elements.slice(0, 100).map((element) => {
-      const authorName =
-        element.querySelector('[class*="author"]')?.textContent?.trim() ??
-        element.querySelector("a")?.textContent?.trim() ??
-        "unknown";
-      const content =
-        element.querySelector('[class*="content"]')?.textContent?.trim() ??
-        element.textContent?.trim() ??
-        "";
-      const publishedAt =
-        element.querySelector("time")?.textContent?.trim() ??
-        element.querySelector('[class*="time"]')?.textContent?.trim() ??
-        null;
+  const comments = await withNavigationRetry(
+    () =>
+      page.locator(selector).evaluateAll((elements) =>
+        elements.slice(0, 100).map((element) => {
+          const authorName =
+            element.querySelector('[class*="author"]')?.textContent?.trim() ??
+            element.querySelector("a")?.textContent?.trim() ??
+            "unknown";
+          const content =
+            element.querySelector('[class*="content"]')?.textContent?.trim() ??
+            element.textContent?.trim() ??
+            "";
+          const publishedAt =
+            element.querySelector("time")?.textContent?.trim() ??
+            element.querySelector('[class*="time"]')?.textContent?.trim() ??
+            null;
 
-      return {
-        authorName,
-        content,
-        publishedAt
-      };
-    })
+          return {
+            authorName,
+            content,
+            publishedAt
+          };
+        })
+      ),
+    () => waitForPageStability(page)
   );
 
   return comments.filter((comment) => comment.content.length > 0);
@@ -332,19 +532,24 @@ async function persistExtractedPost(
   return "stored";
 }
 
-export async function ensureLoggedIn(context: BrowserContext): Promise<void> {
-  const page = context.pages()[0] ?? (await context.newPage());
+export async function ensureLoggedIn(context: BrowserContext, options: LoginWaitOptions = {}): Promise<void> {
+  const loginTimeoutMs = options.loginTimeoutMs ?? LOGIN_TIMEOUT_MS;
+  const loginPollIntervalMs = options.loginPollIntervalMs ?? LOGIN_POLL_INTERVAL_MS;
+  const page = await getPrimaryRednotePage(context);
 
   await page.goto(REDNOTE_HOME_URL, { waitUntil: "domcontentloaded" });
-  await page.waitForTimeout(2_000);
+  await waitForPageStability(page);
+  await page.bringToFront().catch(() => {});
 
-  const authenticated = await anySelectorExists(page, REDNOTE_SELECTORS.authIndicators);
+  const authenticated = await isAuthenticated(page);
   if (authenticated) {
     return;
   }
 
-  await promptForEnter("Log in to REDnote in the opened browser window.");
+  console.log("Log in to REDnote in the opened browser window. Waiting for the account avatar to appear...");
+  await waitForAuthentication(page, loginTimeoutMs, loginPollIntervalMs);
   await page.goto(REDNOTE_HOME_URL, { waitUntil: "domcontentloaded" });
+  await waitForPageStability(page);
 }
 
 export async function crawlTopics(context: BrowserContext, options: CrawlTopicOptions[]): Promise<CrawlerRunSummary> {
@@ -357,34 +562,51 @@ export async function crawlTopics(context: BrowserContext, options: CrawlTopicOp
   };
 
   for (const option of options) {
-    const searchPage = context.pages()[0] ?? (await context.newPage());
-    const detailPage = await context.newPage();
+    const searchPage = await getPrimaryRednotePage(context);
+    let detailPage: Page | null = null;
     const seenUrls = new Set<string>();
+    let abortTopic = false;
 
     option.database.logRunEvent(option.runStartedAt, option.topic, null, "topic_start", "Starting topic crawl.");
     await searchPage.goto(buildSearchUrl(option.topic), { waitUntil: "domcontentloaded" });
-    await searchPage.waitForTimeout(2_000);
+    await waitForPageStability(searchPage);
     await sortResultsByNewest(searchPage);
+    await waitForPageStability(searchPage);
 
     let storedForTopic = 0;
     let stallCount = 0;
 
     while (storedForTopic < option.perTopicNewPostLimit && stallCount < 5) {
-      const candidateUrls = await collectCandidateUrls(searchPage);
-      const unseenUrls = candidateUrls.filter((candidateUrl) => !seenUrls.has(candidateUrl));
+      const searchCandidates = await collectSearchResultCandidates(searchPage);
+      const unseenCandidates = searchCandidates.filter((candidate) => !seenUrls.has(candidate.url));
 
-      if (unseenUrls.length === 0) {
+      for (const candidate of unseenCandidates) {
+        seenUrls.add(candidate.url);
+        if (option.database.hasPost(candidate.noteId)) {
+          option.database.logRunEvent(
+            option.runStartedAt,
+            option.topic,
+            candidate.noteId,
+            "duplicate_skip",
+            "Post already exists in the database."
+          );
+          summary.duplicatePosts += 1;
+        }
+      }
+
+      const eligibleCandidates = filterSearchResultCandidates(unseenCandidates, option.database);
+
+      if (eligibleCandidates.length === 0) {
         stallCount += 1;
       } else {
         stallCount = 0;
       }
 
-      for (const candidateUrl of unseenUrls) {
-        seenUrls.add(candidateUrl);
+      for (const candidate of eligibleCandidates) {
+        const candidateUrl = candidate.url;
 
         try {
-          await detailPage.goto(candidateUrl, { waitUntil: "domcontentloaded" });
-          await detailPage.waitForTimeout(1_500);
+          detailPage = await openCandidateInDetailPage(context, detailPage, candidateUrl);
 
           const extractedPost = await extractPost(detailPage, option.topic);
           const status = await persistExtractedPost(detailPage, extractedPost, { ...option, summary });
@@ -404,18 +626,29 @@ export async function crawlTopics(context: BrowserContext, options: CrawlTopicOp
             error instanceof Error ? error.message : "Unknown crawl error."
           );
           summary.failedPosts += 1;
+
+          if (!isBrowserConnected(context)) {
+            abortTopic = true;
+            break;
+          }
+
+          if (detailPage?.isClosed()) {
+            detailPage = null;
+          }
         }
       }
 
-      if (storedForTopic >= option.perTopicNewPostLimit) {
+      if (storedForTopic >= option.perTopicNewPostLimit || abortTopic) {
         break;
       }
 
       await searchPage.mouse.wheel(0, 2_500);
-      await searchPage.waitForTimeout(1_500);
+      await waitForPageStability(searchPage);
     }
 
-    await detailPage.close();
+    if (detailPage) {
+      await detailPage.close();
+    }
     option.database.logRunEvent(option.runStartedAt, option.topic, null, "topic_complete", `Stored ${storedForTopic} new posts.`);
     summary.topicsProcessed += 1;
   }
