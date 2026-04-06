@@ -1,0 +1,10 @@
+{
+  "topics": [
+    "club events"
+  ],
+  "perTopicNewPostLimit": 5,
+  "browserProfileDir": "./storage/browser-profile",
+  "databasePath": "./storage/sqlite/crawler.db",
+  "mediaDir": "./storage/media",
+  "commentsDir": "./storage/comments"
+}
